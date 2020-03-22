@@ -1,0 +1,454 @@
+---
+title: Simulating COVID-19 interventions with R
+author: Tim Churches
+date: '2020-03-21'
+output:
+  html_document:
+    self_contained: false
+---
+
+
+```{r installation, include=FALSE, eval=TRUE}
+for (pkg in c("tidyverse", "magrittr", "lubridate", "knitr", 
+              "devtools", "DiagrammeR", "EpiModel", 
+              "parallel", "foreach", "tictoc", "patchwork")) 
+  if (!requireNamespace(pkg)) install.packages(pkg)
+
+```
+
+```{r setup, include=FALSE, eval=TRUE}
+knitr::opts_chunk$set(echo = FALSE, cache=TRUE,
+                      tidy.opts=list(width.cutoff=60),
+                      tidy=TRUE)
+
+library(tidyverse)
+library(patchwork)
+library(magrittr)
+library(lubridate)
+library(knitr)
+library(tictoc)
+suppressMessages(library(EpiModel))
+library(DiagrammeR)
+library(devtools)
+library(parallel)
+library(foreach)
+
+tic()
+```
+
+# Source code for The Conversation article, March 2020
+
+Please read the technical blog posts [here](https://timchurches.github.io/blog/posts/2020-03-10-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-1/) and  [here](https://timchurches.github.io/blog/posts/2020-03-18-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-2/) before attempting to use the code below.
+
+## Simulation model compartment diagram
+
+```{r, echo=FALSE, eval=TRUE, message=FALSE, layout="l-page"}
+grViz("
+digraph SEIQHRF {
+
+  # a 'graph' statement
+  graph [overlap = false, fontsize = 10] #, rankdir = LR]
+
+  # several 'node' statements
+  node [shape = box,
+        fontname = Helvetica]
+  S[label='S=Susceptible'];
+  E[label='E=Exposed and infected,\nasymptomatic,\npotentially infectious'];
+  I[label='I=Infected and infectious'];
+  Q[label='Q=(Self-)isolated\n(infectious)'];
+  H[label='H=Requires\nhospitalisation'];
+  R[label='R=Recovered/immune'];
+  F[label='F=Case fatality']
+
+  # several 'edge' statements
+  S->E
+  I->S[style='dashed']
+  E->I
+  E->S[style='dashed']
+  I->Q
+  Q->S[style='dashed']
+  I->R
+  I->H
+  H->F
+  H->R
+  Q->R
+  Q->H
+}
+")
+```
+
+# Baseline simulation
+
+## Load EpiModel extensions
+
+```{r, echo=TRUE, eval=TRUE, message=FALSE}
+source_files <- c("_icm.mod.init.seiqhrf.R",
+                  "_icm.mod.status.seiqhrf.R",
+                  "_icm.mod.vital.seiqhrf.R",
+                  "_icm.control.seiqhrf.R",
+                  "_icm.utils.seiqhrf.R",
+                  "_icm.saveout.seiqhrf.R",
+                  "_icm.icm.seiqhrf.R")
+
+src_path <- paste0("./_posts/2020-03-18-modelling-the-effects-of-public-health-",
+            "interventions-on-covid-19-transmission-part-2/")
+
+gist_url <- "https://gist.github.com/timchurches/92073d0ea75cfbd387f91f7c6e624bd7"
+
+local_source <- FALSE
+
+for (source_file in source_files) {
+  if (local_source) {
+    source(paste(src_path, source_file, sep=""))
+  } else {
+    source_gist(gist_url, filename=source_file)
+  }
+}
+```
+
+## Simulation harness function with baseline defaults
+
+```{r, echo=TRUE, eval=TRUE}
+# function to set-up and run the baseline simulations
+
+hc_scaler <- 10 # 1 for 10,000 pop, 10 for 100,000 pop, 100 for 1,000,000 pop
+
+simulate <- function(# control.icm params
+                     type = "SEIQHRF", 
+                     nsteps = 366, 
+                     nsims = 8,
+                     ncores = 4,
+                     prog.rand = FALSE,
+                     rec.rand = FALSE,
+                     fat.rand = TRUE,
+                     quar.rand = FALSE,
+                     hosp.rand = FALSE,
+                     disch.rand = TRUE,
+                     infection.FUN = infection.seiqhrf.icm,
+                     recovery.FUN = progress.seiqhrf.icm,
+                     departures.FUN = departures.seiqhrf.icm,
+                     arrivals.FUN = arrivals.icm,
+                     get_prev.FUN = get_prev.seiqhrf.icm,
+                     # init.icm params
+                     s.num = 99970, # 999970
+                     e.num=0,
+                     i.num = 3, # 30
+                     q.num=0,
+                     h.num=0,
+                     r.num = 0,
+                     f.num = 0,
+                     # param.icm params
+                     inf.prob.e = 0.02, 
+                     act.rate.e = 10,
+                     inf.prob.i = 0.05, 
+                     act.rate.i = 10,
+                     inf.prob.q = 0.02, 
+                     act.rate.q = 2.5,                    
+                     quar.rate = 1/30, 
+                     hosp.rate = 1/100,
+                     disch.rate = 1/15,
+                     prog.rate = 1/10,
+                     prog.dist.scale = 5,
+                     prog.dist.shape = 1.5,
+                     rec.rate = 1/20,
+                     rec.dist.scale = 35,
+                     rec.dist.shape = 1.5,
+                     fat.rate.base = 1/50,
+                     hosp.cap = 40*hc_scaler, # 4000 replace red ref line too
+                     fat.rate.overcap = 1/25,
+                     fat.tcoeff = 0.5,
+                     vital = TRUE,
+                     a.rate = (10.5/365)/1000, 
+                     a.prop.e = 0.01,
+                     a.prop.i = 0.001,
+                     a.prop.q = 0.01,
+                     ds.rate = (7/365)/1000, 
+                     de.rate = (7/365)/1000, 
+                     di.rate = (7/365)/1000,
+                     dq.rate = (7/365)/1000,
+                     dh.rate = (20/365)/1000,
+                     dr.rate = (7/365)/1000,
+                     out="mean"
+                    ) {
+
+  control <- control.icm(type = type, 
+                         nsteps = nsteps, 
+                         nsims = nsims,
+                         ncores = ncores,
+                         prog.rand = prog.rand,
+                         rec.rand = rec.rand,
+                         infection.FUN = infection.FUN,
+                         recovery.FUN = recovery.FUN,
+                         arrivals.FUN = arrivals.FUN,
+                         departures.FUN = departures.FUN,
+                         get_prev.FUN = get_prev.FUN)
+
+  init <- init.icm(s.num = s.num,
+                   e.num = e.num,
+                   i.num = i.num,
+                   q.num = q.num,
+                   h.num = h.num,
+                   r.num = r.num,
+                   f.num = f.num)
+
+  param <-  param.icm(inf.prob.e = inf.prob.e, 
+                      act.rate.e = act.rate.e,
+                      inf.prob.i = inf.prob.i, 
+                      act.rate.i = act.rate.i,
+                      inf.prob.q = inf.prob.q, 
+                      act.rate.q = act.rate.q,                    
+                      quar.rate = quar.rate,
+                      hosp.rate = hosp.rate,
+                      disch.rate = disch.rate,
+                      prog.rate = prog.rate,
+                      prog.dist.scale = prog.dist.scale,
+                      prog.dist.shape = prog.dist.shape,
+                      rec.rate = rec.rate,
+                      rec.dist.scale = rec.dist.scale,
+                      rec.dist.shape = rec.dist.shape,
+                      fat.rate.base = fat.rate.base,
+                      hosp.cap = hosp.cap,
+                      fat.rate.overcap = fat.rate.overcap,
+                      fat.tcoeff = fat.tcoeff,
+                      vital = vital,
+                      a.rate = a.rate, 
+                      a.prop.e = a.prop.e,
+                      a.prop.i = a.prop.i,
+                      a.prop.q = a.prop.q,
+                      ds.rate = ds.rate, 
+                      de.rate = de.rate, 
+                      di.rate = di.rate,
+                      dq.rate = dq.rate,
+                      dh.rate = dh.rate,
+                      dr.rate = dr.rate)
+
+  sim <- icm.seiqhrf(param, init, control)
+  sim_df <- as.data.frame(sim, out=out)
+
+  return(list(sim=sim, df=sim_df))
+}
+```
+
+# Simulation runs
+
+## Baseline
+
+```{r, echo=TRUE, eval=TRUE}
+baseline_sim <- simulate(ncores=4)
+```
+
+Visualise the results as a set of time-series of the daily count of our 100,000 individuals in each compartment.
+
+```{r, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+baseline_plot_df <- baseline_sim$df %>%
+  # use only the prevalence columns
+  select(time, s.num, e.num, i.num, q.num, 
+         h.num, r.num, f.num) %>%
+  pivot_longer(-c(time),
+               names_to="compartment",
+               values_to="count") %>%
+  filter(time <= 250)
+
+# define a standard set of colours to represent compartments
+compcols <- c("s.num" = "yellow", "e.num" = "orange", "i.num" = "red",
+              "q.num" = "cyan", "h.num" = "magenta", "r.num" = "lightgreen",
+              "f.num" = "black")
+complabels <- c("s.num" = "Susceptible", "e.num" = "Infected/asymptomatic", 
+                "i.num" = "Infected/infectious", "q.num" = "Isolated",
+                "h.num" = "Requires hospitalisation", "r.num" = "Recovered",
+                "f.num" = "Deaths due to COVID-19")
+
+baseline_plot_df %>%
+  # examine only the first 100 days since it
+  # is all over by then using the default parameters
+  filter(time <= 100) %>%
+  ggplot(aes(x=time, y=count, colour=compartment)) +
+    geom_line(size=2, alpha=0.7) +
+    scale_colour_manual(values = compcols, labels=complabels) +
+    theme_dark() +
+    labs(title="Baseline simulation",
+         x="Days since beginning of epidemic",
+         y="Prevalence (persons)")
+```
+
+OK, that looks very reasonable. Note that almost the entire population ends up being infected. However, the **S** and **R** compartments dominate the plot (which is good, because it means humanity will survive!), so let's re-plot leaving out those compartments so we can see a bit more detail.
+
+```{r, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+baseline_plot_df %>%
+  filter(compartment %in% c("e.num","i.num",
+                            "q.num","h.num",
+                            "f.num")) %>%
+  filter(time <= 100) %>%
+  ggplot(aes(x=time, y=count, colour=compartment)) +
+    geom_line(size=2, alpha=0.7) +
+    scale_colour_manual(values = compcols, labels=complabels) +
+    theme_dark() +
+    labs(title="Baseline simulation",
+         x="Days since beginning of epidemic",
+         y="Prevalence (persons)")
+```
+
+Notice that the **I** compartment curve lags behind the **E** compartment curve -- the lag is the incubation period, and that the **Q** curve lags still further as infected people only reluctantly and belatedly self-isolate themselves (in this baseline scenario). 
+
+## Running intervention experiments
+
+### Scenario 1
+
+Ramp up self-isolation rate, starting at day 1, ramp up to 0.3333, over 15 day period, then ongoing.
+
+```{r, echo=TRUE, eval=TRUE}
+isolation_ramp <- function(t) {
+  ifelse(t <= 2, 0.0333, ifelse(t <= 17, 0.0333 + (t-3)*(0.3333 - 0.03333)/15, 0.3333))
+}
+
+exp1_isolation_ramp_sim <- simulate(quar.rate = isolation_ramp(1:366))  
+```
+
+### Scenario 2
+
+Ramp up self-isolation rate, starting at day 1, ramp up to 0.6666, over 15 day period, then ongoing.
+
+```{r, echo=TRUE, eval=TRUE}
+big_isolation_ramp <- function(t) {
+  ifelse(t <= 2, 0.0333, ifelse(t <= 17, 0.0333 + (t-3)*(0.6666 - 0.03333)/15, 0.6666))
+}
+
+exp2_big_isolation_ramp_sim <- simulate(quar.rate = big_isolation_ramp(1:366))  
+```
+
+### Scenario 3
+
+As per scenario 1 plus a moderate increase in social distancing to 5 for everyone (halving the `act.rate`), again ramping it down between days 15 and 30, then maintain at 5 for a further 45 days, then revert to 10.
+
+```{r, echo=TRUE, eval=TRUE}
+social_distance_ramp <- function(t) {
+  ifelse(t <= 17, 10, ifelse(t <= 32, 10 - (t-17)*(10 - 5)/15, ifelse(t <= 77, 5, 10)))
+}
+
+exp3_soc_dist_ramp_sim <- simulate(act.rate.i = social_distance_ramp(1:366),
+                                   act.rate.e = social_distance_ramp(1:366),
+                                   quar.rate = isolation_ramp(1:366))  
+```
+
+### Scenario 4
+
+As per scenario 3 but four week lockdown starting at day 30.
+
+```{r, echo=TRUE, eval=TRUE}
+fourweek_lockdown_day30_vector <-c(rep(10, 32), rep(2.5, 30), rep(10, 304))
+
+exp4_fourweek_lockdown_day30_sim <- simulate(act.rate.i = fourweek_lockdown_day30_vector,
+                                             act.rate.e = fourweek_lockdown_day30_vector,
+                                             quar.rate = isolation_ramp(1:366))  
+```
+
+### Scenario 5
+
+As per scenario 4 but eight week lockdown starting at day 30.
+
+```{r, echo=TRUE, eval=TRUE}
+eightweek_lockdown_day30_vector <-c(rep(10, 32), rep(2.5, 60), rep(10, 274))
+
+exp5_eightweek_lockdown_day30_sim <- simulate(act.rate.i = eightweek_lockdown_day30_vector,
+                                             act.rate.e = eightweek_lockdown_day30_vector,
+                                             quar.rate = isolation_ramp(1:366))  
+```
+
+### Scenario 6
+
+As per scenario 4 but eight week lockdown starting at day 30, followed by self-isolation with high compliance (66% per day) on an ongoing basis.
+
+```{r, echo=TRUE, eval=TRUE}
+post_lockdown_isolation_ramp <- function(t) {
+  ifelse(t <= 2, 0.0333, ifelse(t <= 17, 0.0333 + (t-3)*(0.3333 - 0.03333)/15, 
+                                ifelse(t <= 92, 0.3333, 0.6666)))
+}
+
+exp6_eightweek_lockdown_day30_then_big_isol_sim <- simulate(act.rate.i = eightweek_lockdown_day30_vector,
+                                             act.rate.e = eightweek_lockdown_day30_vector,
+                                             quar.rate = post_lockdown_isolation_ramp(1:366))  
+```
+
+# Results
+
+Now let's examine the results.
+
+```{r, echo=TRUE, eval=TRUE, warning=FALSE, fig.height=12, fig.width=10}
+elongate <- function(sim) {
+  
+  sim_df <- sim$df %>%
+  # use only the prevalence columns
+  select(time, s.num, e.num, i.num, q.num, 
+         h.num, r.num, f.num) %>%
+  # examine only the first 100 days since it
+  # is all over by then using the default parameters
+  filter(time <= 250) %>%
+  pivot_longer(-c(time),
+               names_to="compartment",
+               values_to="count")
+  return(sim_df)
+}
+
+exp1_isolation_ramp_sim_df <- elongate(exp1_isolation_ramp_sim)
+exp2_big_isolation_ramp_sim_df <- elongate(exp2_big_isolation_ramp_sim)
+exp3_soc_dist_ramp_sim_df <- elongate(exp3_soc_dist_ramp_sim)
+exp4_fourweek_lockdown_day30_sim_df <- elongate(exp4_fourweek_lockdown_day30_sim )
+exp5_eightweek_lockdown_day30_sim_df <- elongate(exp5_eightweek_lockdown_day30_sim)
+exp6_eightweek_lockdown_day30_then_big_isol_sim_df <- elongate(exp6_eightweek_lockdown_day30_then_big_isol_sim)
+
+combined_plot_df <- baseline_plot_df %>%
+  mutate(experiment="Baseline") %>%
+  bind_rows(exp1_isolation_ramp_sim_df %>%
+              mutate(experiment="Scenario 1")) %>%
+  bind_rows(exp2_big_isolation_ramp_sim_df %>%
+              mutate(experiment="Scenario 2")) %>%
+  bind_rows(exp3_soc_dist_ramp_sim_df %>%
+              mutate(experiment="Scenario 3")) %>%
+  bind_rows(exp4_fourweek_lockdown_day30_sim_df %>%
+              mutate(experiment="Scenario 4")) %>%
+  bind_rows(exp5_eightweek_lockdown_day30_sim_df %>%
+              mutate(experiment="Scenario 5")) %>%
+  bind_rows(exp6_eightweek_lockdown_day30_then_big_isol_sim_df %>%
+              mutate(experiment="Scenario 6"))
+
+p1 <- combined_plot_df %>%
+  filter(compartment %in% c("e.num","i.num",
+                            "q.num")) %>%
+  ggplot(aes(x=time, y=count, colour=compartment)) +
+    geom_line(size=2, alpha=0.7) +
+    facet_grid(experiment ~ .) +
+    scale_colour_manual(values = compcols, labels=complabels) +
+    scale_y_continuous(labels = scales::comma) +
+    theme_dark() +
+    theme(legend.title = element_blank(),
+          legend.position = "top",
+          legend.direction = "horizontal") +
+    labs(x="Days since beginning of epidemic",
+         y="Prevalence (persons)")
+
+p2 <- combined_plot_df %>%
+  filter(compartment %in% c("h.num",
+                            "f.num")) %>%
+  ggplot(aes(x=time, y=count, colour=compartment)) +
+    geom_line(size=2, alpha=0.7) +
+    geom_hline(yintercept=hc_scaler*40, colour="red") +
+    annotate("text", x = 210, y = hc_scaler*(40 - 8.5), 
+             label = "Hospital capacity", size=3) +
+    facet_grid(experiment ~ .) +
+    scale_colour_manual(values = compcols, labels=complabels) +
+    scale_y_continuous(labels = scales::comma) +
+    labs(x="Days since beginning of epidemic",
+         y="") +
+    theme_dark() +
+    theme(legend.title = element_blank(),
+          legend.position = "top",
+          legend.direction = "horizontal")
+
+p1 + p2
+```
+
+```{r, echo=FALSE, eval=TRUE, warning=FALSE}
+toc()
+```
+
+
