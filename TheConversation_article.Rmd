@@ -4,11 +4,16 @@ author: Tim Churches
 date: '2020-03-21'
 output:
   html_document:
-    self_contained: false
+    self_contained: true
 ---
 
+# Source code for The Conversation article, March 2020
 
-```{r installation, include=FALSE, eval=TRUE}
+Please read the technical blog posts [here](https://timchurches.github.io/blog/posts/2020-03-10-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-1/) and  [here](https://timchurches.github.io/blog/posts/2020-03-18-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-2/) before attempting to use the code below.
+
+## Set-up
+
+```{r installation, include=TRUE, echo=TRUE, eval=TRUE, message=FALSE}
 for (pkg in c("tidyverse", "magrittr", "lubridate", "knitr", 
               "devtools", "DiagrammeR", "EpiModel", 
               "parallel", "foreach", "tictoc", "patchwork")) 
@@ -16,7 +21,7 @@ for (pkg in c("tidyverse", "magrittr", "lubridate", "knitr",
 
 ```
 
-```{r setup, include=FALSE, eval=TRUE}
+```{r setup, include=TRUE, eval=TRUE, message=FALSE}
 knitr::opts_chunk$set(echo = FALSE, cache=TRUE,
                       tidy.opts=list(width.cutoff=60),
                       tidy=TRUE)
@@ -36,13 +41,10 @@ library(foreach)
 tic()
 ```
 
-# Source code for The Conversation article, March 2020
-
-Please read the technical blog posts [here](https://timchurches.github.io/blog/posts/2020-03-10-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-1/) and  [here](https://timchurches.github.io/blog/posts/2020-03-18-modelling-the-effects-of-public-health-interventions-on-covid-19-transmission-part-2/) before attempting to use the code below.
 
 ## Simulation model compartment diagram
 
-```{r, echo=FALSE, eval=TRUE, message=FALSE, layout="l-page"}
+```{r, echo=TRUE, eval=TRUE, message=FALSE, layout="l-page"}
 grViz("
 digraph SEIQHRF {
 
